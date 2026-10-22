@@ -33,7 +33,8 @@ arena: std.mem.Allocator,
 store: *DocumentStore,
 ip: *InternPool,
 resolved_callsites: std.AutoHashMapUnmanaged(Declaration.Param, ?Type) = .empty,
-resolved_nodes: std.HashMapUnmanaged(NodeWithUri, ?Binding, NodeWithUri.Context, std.hash_map.default_max_load_percentage) = .empty,
+resolved_nodes: std.HashMapUnmanaged(ResolutionKey, ?Binding, ResolutionKey.Context, std.hash_map.default_max_load_percentage) = .empty,
+comptime_values: TokenToTypeMap = .empty,
 collect_callsite_references: bool,
 /// avoid unnecessarily parsing number literals
 resolve_number_literal_values: bool,
@@ -42,6 +43,35 @@ root_handle: ?*DocumentStore.Handle,
 max_conditional_combos: usize = 200,
 
 const NodeSet = std.HashMapUnmanaged(NodeWithUri, void, NodeWithUri.Context, std.hash_map.default_max_load_percentage);
+
+const ResolutionKey = struct {
+    node: NodeWithUri,
+    // The same syntax can resolve differently in each specialization or value-evaluation mode.
+    values: TokenToTypeMap,
+    resolve_numbers: bool,
+
+    const Context = struct {
+        pub fn hash(_: Context, key: ResolutionKey) u64 {
+            var hash_value = (NodeWithUri.Context{}).hash(key.node);
+            for (key.values.keys(), key.values.values()) |token, value| {
+                var hasher: std.hash.Wyhash = .init(0);
+                token.hashWithHasher(&hasher);
+                value.hashWithHasher(&hasher);
+                hash_value ^= hasher.final();
+            }
+            return hash_value ^ @intFromBool(key.resolve_numbers);
+        }
+
+        pub fn eql(_: Context, a: ResolutionKey, b: ResolutionKey) bool {
+            if (!(NodeWithUri.Context{}).eql(a.node, b.node)) return false;
+            if (a.resolve_numbers != b.resolve_numbers or a.values.count() != b.values.count()) return false;
+            for (a.values.keys(), a.values.values()) |token, value| {
+                if (!value.eql(b.values.get(token) orelse return false)) return false;
+            }
+            return true;
+        }
+    };
+};
 
 pub const Error = std.mem.Allocator.Error || std.Io.Cancelable;
 
@@ -802,6 +832,7 @@ fn resolveGenericTypeInternal(
     bound_params: TokenToTypeMap,
     visiting: *Type.Data.GenericSet,
 ) error{OutOfMemory}!Type {
+    if (!ty.isGenericType()) return ty;
     var resolved = ty;
     if (!ty.is_type_val) {
         resolved = try resolved.typeOf(analyser);
@@ -1852,6 +1883,18 @@ fn resolveFunctionTypeFromCall(
         const param_type = param.type;
         if (!param_type.is_type_val) continue;
 
+        if (param.modifier == .comptime_param and !param_type.isMetaType() and param_type.data != .anytype_parameter) {
+            const previous = analyser.resolve_number_literal_values;
+            analyser.resolve_number_literal_values = true;
+            defer analyser.resolve_number_literal_values = previous;
+            const value = (if (param_type.ipIndex()) |ty|
+                try analyser.resolveCoercedIPValue(ty, .of(arg, handle))
+            else
+                try analyser.resolveInternPoolValue(.of(arg, handle))) orelse continue;
+            try meta_params.put(analyser.arena, .{ .token = param_name_token, .handle = func_info.handle }, Type.fromIP(analyser, analyser.ip.typeOf(value), value));
+            continue;
+        }
+
         const argument_type = (try analyser.resolveTypeOfNodeInternal(.of(arg, handle))) orelse continue;
 
         switch (param_type.data) {
@@ -1960,11 +2003,12 @@ pub fn resolveBindingOfNode(analyser: *Analyser, options: ResolveOptions) Error!
 
 fn resolveBindingOfNodeInternal(analyser: *Analyser, options: ResolveOptions) Error!?Binding {
     const node_handle = options.node_handle;
-    const node_with_uri: NodeWithUri = .{
-        .node = node_handle.node,
-        .uri = node_handle.handle.uri,
+    const key: ResolutionKey = .{
+        .node = .{ .node = node_handle.node, .uri = node_handle.handle.uri },
+        .values = analyser.comptime_values,
+        .resolve_numbers = analyser.resolve_number_literal_values,
     };
-    const gop = try analyser.resolved_nodes.getOrPut(analyser.gpa, node_with_uri);
+    const gop = try analyser.resolved_nodes.getOrPut(analyser.gpa, key);
     if (gop.found_existing) return gop.value_ptr.*;
 
     // we insert null before resolving the type so that a recursive definition doesn't result in an infinite loop
@@ -1972,7 +2016,7 @@ fn resolveBindingOfNodeInternal(analyser: *Analyser, options: ResolveOptions) Er
 
     const binding = try analyser.resolveBindingOfNodeUncached(options);
     if (binding != null) {
-        analyser.resolved_nodes.getPtr(node_with_uri).?.* = binding;
+        analyser.resolved_nodes.getPtr(key).?.* = binding;
     }
 
     return binding;
@@ -3708,7 +3752,10 @@ pub const Type = struct {
                             var new_params: TokenToTypeMap = .empty;
                             try new_params.ensureTotalCapacity(analyser.arena, info.bound_params.count());
                             for (info.bound_params.keys(), info.bound_params.values()) |k, v| {
-                                const t = try analyser.resolveGenericTypeInternal(v, bound_params, visiting);
+                                const t = if (!v.is_type_val)
+                                    bound_params.get(k) orelse v
+                                else
+                                    try analyser.resolveGenericTypeInternal(v, bound_params, visiting);
                                 new_params.putAssumeCapacity(k, t);
                             }
                             break :blk new_params;
@@ -4728,8 +4775,18 @@ pub const Type = struct {
                             var it: ast.FnParamIterator = .init(&func, tree);
                             while (it.next()) |param| {
                                 const param_type_expr = param.type_expr orelse continue;
-                                if (!Analyser.isMetaType(tree, param_type_expr)) continue;
                                 const param_name_token = param.name_token orelse continue;
+                                if (!Analyser.isMetaType(tree, param_type_expr)) {
+                                    const value = info.bound_params.get(.{ .token = param_name_token, .handle = handle }) orelse continue;
+                                    if (!first) try writer.writeByte(',');
+                                    if (value.ipIndex() != null) {
+                                        try value.rawStringify(writer, analyser, options);
+                                    } else {
+                                        try writer.writeAll(tree.tokenSlice(param_name_token));
+                                    }
+                                    first = false;
+                                    continue;
+                                }
                                 if (!first) {
                                     try writer.writeByte(',');
                                 }
@@ -5098,12 +5155,24 @@ pub fn getFieldAccessType(
                     continue;
                 }
 
-                const ty = try analyser.resolveFuncProtoOfCallable(current_type.?) orelse return null;
+                var ty = try analyser.resolveFuncProtoOfCallable(current_type.?) orelse return null;
 
                 // Can't call a function type, we need a function type instance.
                 if (current_type.?.is_type_val) return null;
 
-                // TODO Actually bind params here when calling functions instead of just skipping args.
+                if (ty.isGenericType()) {
+                    const lparen_index = loc.start + tok.loc.start;
+                    // shortcut: scan recovered nodes; index calls if this becomes a completion bottleneck.
+                    const nodes = try ast.nodesOverlappingIndexIncludingParseErrors(analyser.arena, &handle.tree, lparen_index);
+                    defer analyser.arena.free(nodes);
+                    for (nodes) |node| {
+                        var call_buffer: [1]Ast.Node.Index = undefined;
+                        const call = handle.tree.fullCall(&call_buffer, node) orelse continue;
+                        if (handle.tree.tokenStart(call.ast.lparen) != lparen_index) continue;
+                        ty = try analyser.resolveFunctionTypeFromCall(handle, call, ty);
+                        break;
+                    }
+                }
                 current_type = try analyser.resolveReturnType(ty) orelse return null;
 
                 if (do_unwrap_error_payload) {
@@ -5903,6 +5972,25 @@ pub const DeclWithHandle = struct {
         const tracy_zone = tracy.trace(@src());
         defer tracy_zone.end();
 
+        const previous_values = analyser.comptime_values;
+        defer analyser.comptime_values = previous_values;
+        if (self.container_type) |container| {
+            if (container.data == .container) {
+                var values = previous_values;
+                var cloned = false;
+                for (container.data.container.bound_params.keys(), container.data.container.bound_params.values()) |token, value| {
+                    if (value.is_type_val or value.ipIndex() == null) continue;
+                    if (values.get(token)) |old| if (old.eql(value)) continue;
+                    if (!cloned) {
+                        values = try values.clone(analyser.arena);
+                        cloned = true;
+                    }
+                    try values.put(analyser.arena, token, value);
+                }
+                analyser.comptime_values = values;
+            }
+        }
+
         const tree = &self.handle.tree;
         var resolved_ty = switch (self.decl) {
             .ast_node => |node| try analyser.resolveTypeOfNodeInternal(.{
@@ -5913,6 +6001,10 @@ pub const DeclWithHandle = struct {
                 // the `get` function never fails on declarations from the DocumentScope but
                 // there may be manually created Declarations with invalid parameter indices.
                 const param = pay.get(tree) orelse return null;
+
+                if (analyser.comptime_values.get(.{ .token = self.decl.nameToken(tree), .handle = self.handle })) |value| {
+                    break :blk value;
+                }
 
                 // handle anytype
                 const type_expr = param.type_expr orelse {
@@ -6264,9 +6356,15 @@ pub fn innermostContainer(analyser: *Analyser, handle: *DocumentStore.Handle, so
                 var it: ast.FnParamIterator = .init(&func, tree);
                 while (it.next()) |param| {
                     const param_type_expr = param.type_expr orelse continue;
-                    if (!Analyser.isMetaType(tree, param_type_expr)) continue;
                     const param_name_token = param.name_token orelse continue;
                     const token_handle: TokenWithHandle = .{ .token = param_name_token, .handle = handle };
+                    if (!Analyser.isMetaType(tree, param_type_expr)) {
+                        const modifier = param.comptime_noalias orelse continue;
+                        if (tree.tokenTag(modifier) != .keyword_comptime) continue;
+                        const ty = analyser.comptime_values.get(token_handle) orelse Type.fromIP(analyser, .unknown_type, null);
+                        try pending_meta_params.put(analyser.gpa, token_handle, ty);
+                        continue;
+                    }
                     const ty: Type = .{ .data = .{ .type_parameter = token_handle }, .is_type_val = true };
                     try pending_meta_params.put(analyser.gpa, token_handle, ty);
                 }

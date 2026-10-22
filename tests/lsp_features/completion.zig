@@ -18,6 +18,28 @@ const Completion = struct {
     deprecated: bool = false,
 };
 
+test "comptime value specialization completion" {
+    const prefix =
+        \\fn Matrix(comptime n: comptime_int) type {
+        \\    return struct { cols: [n]@Vector(n, f32) };
+        \\}
+        \\const Mat2 = Matrix(2);
+        \\const Mat3 = Matrix(3);
+        \\var two: Mat2 = undefined;
+        \\var three: Mat3 = undefined;
+        \\
+    ;
+    try testCompletion(prefix ++ "const x = two.<cursor>", &.{
+        .{ .label = "cols", .kind = .Field, .detail = "[2]@Vector(2,f32)" },
+    });
+    try testCompletion(prefix ++ "const x = three.<cursor>", &.{
+        .{ .label = "cols", .kind = .Field, .detail = "[3]@Vector(3,f32)" },
+    });
+    try testCompletion(prefix ++ "const x = Matrix(2){}.<cursor>", &.{
+        .{ .label = "cols", .kind = .Field, .detail = "[2]@Vector(2,f32)" },
+    });
+}
+
 test "root scope" {
     try testCompletion(
         \\const foo = 5;
