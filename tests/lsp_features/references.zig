@@ -637,6 +637,123 @@ test "escaped identifier with same name as primitive" {
     );
 }
 
+test "comptime type factory and @This() references" {
+    // Cursor on factory function finds factory calls, Self = @This(), and const instantiations
+    try testSimpleReferences(
+        \\fn <loc>Matrix<cursor></loc>(comptime n: usize) type {
+        \\    return struct {
+        \\        const <loc>Self</loc> = @This();
+        \\        pub fn identity() <loc>Self</loc> {
+        \\            return .{};
+        \\        }
+        \\    };
+        \\}
+        \\pub const <loc>Mat2</loc> = <loc>Matrix</loc>(2);
+        \\pub const <loc>Mat3</loc> = <loc>Matrix</loc>(3);
+        \\fn use(m2: <loc>Mat2</loc>, m3: <loc>Mat3</loc>) void {
+        \\    _ = m2;
+        \\    _ = m3;
+        \\    _ = <loc>Mat2</loc>.identity();
+        \\}
+    );
+
+    // Cursor on `Self = @This()` inside factory (where `gd` on `Mat2` lands) finds all factory & instantiation references
+    try testSimpleReferences(
+        \\fn <loc>Matrix</loc>(comptime n: usize) type {
+        \\    return struct {
+        \\        const <loc>Self<cursor></loc> = @This();
+        \\        pub fn identity() <loc>Self</loc> {
+        \\            return .{};
+        \\        }
+        \\    };
+        \\}
+        \\pub const <loc>Mat2</loc> = <loc>Matrix</loc>(2);
+        \\fn use(m2: <loc>Mat2</loc>) void {
+        \\    _ = m2;
+        \\}
+    );
+
+    // Cursor on `struct` keyword inside factory (where `gd` lands when no `Self = @This()` is present)
+    try testSimpleReferences(
+        \\fn <loc>Handle</loc>(comptime T: type) type {
+        \\    return struct<cursor> {
+        \\        id: T,
+        \\    };
+        \\}
+        \\pub const <loc>VertId</loc> = <loc>Handle</loc>(u16);
+        \\fn use(v: <loc>VertId</loc>) void {
+        \\    _ = v;
+        \\}
+    );
+
+    // Cursor on a specific instantiation (`Mat2`) only finds references to `Mat2`, NOT `Mat3`
+    try testSimpleReferences(
+        \\fn Matrix(comptime n: usize) type {
+        \\    return struct {};
+        \\}
+        \\pub const <loc>Mat2<cursor></loc> = Matrix(2);
+        \\pub const Mat3 = Matrix(3);
+        \\fn use(m2: <loc>Mat2</loc>, m3: Mat3) void {
+        \\    _ = m2;
+        \\    _ = m3;
+        \\}
+    );
+
+    // Cursor on non-factory struct or its `Self = @This()` finds both `S` and `Self`
+    try testSimpleReferences(
+        \\const <loc>S<cursor></loc> = struct {
+        \\    const <loc>Self</loc> = @This();
+        \\    fn init() <loc>Self</loc> {
+        \\        return .{};
+        \\    }
+        \\};
+        \\const x: <loc>S</loc> = <loc>S</loc>.init();
+    );
+    try testSimpleReferences(
+        \\const <loc>S</loc> = struct {
+        \\    const <loc>Self<cursor></loc> = @This();
+        \\    fn init() <loc>Self</loc> {
+        \\        return .{};
+        \\    }
+        \\};
+        \\const x: <loc>S</loc> = <loc>S</loc>.init();
+    );
+
+    // Rename on `Self` only renames `Self` inside the container, not `S`
+    try testReferences(&.{
+        \\const S = struct {
+        \\    const <loc>Self<cursor></loc> = @This();
+        \\    fn init() <loc>Self</loc> {
+        \\        return .{};
+        \\    }
+        \\};
+        \\const x: S = S.init();
+    }, .{ .format = .asymmetric, .request_kind = .rename });
+
+    // Cross-file references when factory is private (`fn Matrix`) and specialization (`pub const Mat2`) is public
+    try testReferences(&.{
+        // Untitled-0.zig
+        \\fn <loc>Matrix<cursor></loc>(comptime n: usize) type {
+        \\    return struct {
+        \\        const <loc>Self</loc> = @This();
+        \\        data: [n]f32,
+        \\        pub fn zero() <loc>Self</loc> {
+        \\            return undefined;
+        \\        }
+        \\    };
+        \\}
+        \\pub const <loc>Mat2</loc> = <loc>Matrix</loc>(2);
+        ,
+        // Untitled-1.zig
+        \\const mod = @import("Untitled-0.zig");
+        \\const <loc>Mat2</loc> = mod.<loc>Mat2</loc>;
+        \\fn compute(m: <loc>Mat2</loc>) void {
+        \\    _ = m;
+        \\}
+        ,
+    }, .{ .format = .asymmetric });
+}
+
 const TestOptions = struct {
     request_kind: RequestKind = .references,
     format: TestFormat,

@@ -94,27 +94,194 @@ fn labelReferences(
     return locations;
 }
 
+fn isThisAlias(tree: *const Ast, node: Ast.Node.Index) bool {
+    const var_decl = tree.fullVarDecl(node) orelse return false;
+    if (tree.tokenTag(var_decl.ast.mut_token) != .keyword_const) return false;
+    const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+    switch (tree.nodeTag(init_node)) {
+        .builtin_call_two,
+        .builtin_call_two_comma,
+        .builtin_call,
+        .builtin_call_comma,
+        => {},
+        else => return false,
+    }
+    return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(init_node)), "@This");
+}
+
+fn findContainerThisAlias(handle: *DocumentStore.Handle, container_node: Ast.Node.Index) ?Analyser.DeclWithHandle {
+    var buf: [2]Ast.Node.Index = undefined;
+    const container_decl = handle.tree.fullContainerDecl(&buf, container_node) orelse return null;
+    for (container_decl.ast.members) |member| {
+        if (isThisAlias(&handle.tree, member)) {
+            return .{ .decl = .{ .ast_node = member }, .handle = handle };
+        }
+    }
+    return null;
+}
+
+fn findFactoryReturnedContainer(tree: *const Ast, func_node: Ast.Node.Index) ?Ast.Node.Index {
+    if (tree.nodeTag(func_node) != .fn_decl) return null;
+    var fn_buf: [1]Ast.Node.Index = undefined;
+    const fn_proto = tree.fullFnProto(&fn_buf, func_node) orelse return null;
+    if (!Analyser.isTypeFunction(tree, fn_proto)) return null;
+
+    const body_node = tree.nodeData(func_node).node_and_node[1];
+    const ret_node = Analyser.findReturnStatement(tree, body_node) orelse return null;
+    const ret_expr = tree.nodeData(ret_node).opt_node.unwrap() orelse return null;
+
+    var buf: [2]Ast.Node.Index = undefined;
+    if (tree.fullContainerDecl(&buf, ret_expr) == null) return null;
+    return ret_expr;
+}
+
+fn findEnclosingContainerOwner(
+    arena: std.mem.Allocator,
+    handle: *DocumentStore.Handle,
+    container_node: Ast.Node.Index,
+) error{OutOfMemory}!?Analyser.DeclWithHandle {
+    if (container_node == .root) return null;
+    const tree = &handle.tree;
+    const nodes = try ast.nodesOverlappingIndex(arena, tree, tree.tokenStart(tree.nodeMainToken(container_node)));
+
+    for (nodes) |ancestor| {
+        if (ancestor == container_node) continue;
+        if (tree.fullVarDecl(ancestor)) |var_decl| {
+            if (var_decl.ast.init_node.unwrap() == container_node) {
+                return .{ .decl = .{ .ast_node = ancestor }, .handle = handle };
+            }
+        }
+        if (findFactoryReturnedContainer(tree, ancestor) == container_node) {
+            return .{ .decl = .{ .ast_node = ancestor }, .handle = handle };
+        }
+    }
+    return null;
+}
+
+fn resolveCalledSymbol(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    call_node: Ast.Node.Index,
+) Analyser.Error!?Analyser.DeclWithHandle {
+    const tree = &handle.tree;
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buf, call_node) orelse return null;
+    const fn_expr = call.ast.fn_expr;
+
+    switch (tree.nodeTag(fn_expr)) {
+        .identifier => {
+            const tok = ast.identifierTokenFromIdentifierNode(tree, fn_expr) orelse return null;
+            const sym = (try analyser.lookupSymbolGlobal(
+                handle,
+                offsets.identifierTokenToNameSlice(tree, tok),
+                tree.tokenStart(tok),
+            )) orelse return null;
+            return try analyser.resolveVarDeclAlias(sym) orelse sym;
+        },
+        .field_access => {
+            const lhs_node, const field_tok = tree.nodeData(fn_expr).node_and_token;
+            const lhs = (try analyser.resolveTypeOfNode(.of(lhs_node, handle))) orelse return null;
+            const deref_lhs = try analyser.resolveDerefType(lhs) orelse lhs;
+            const sym = (try deref_lhs.lookupSymbol(
+                analyser,
+                offsets.identifierTokenToNameSlice(tree, field_tok),
+            )) orelse return null;
+            return try analyser.resolveVarDeclAlias(sym) orelse sym;
+        },
+        else => return null,
+    }
+}
+
+fn isFactoryInstantiationOf(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    var_decl_node: Ast.Node.Index,
+    factory_decl: Analyser.DeclWithHandle,
+) Analyser.Error!bool {
+    const tree = &handle.tree;
+    const var_decl = tree.fullVarDecl(var_decl_node) orelse return false;
+    if (tree.tokenTag(var_decl.ast.mut_token) != .keyword_const) return false;
+    const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+    const called = (try resolveCalledSymbol(analyser, handle, init_node)) orelse return false;
+    return factory_decl.eql(called);
+}
+
+fn resolveContainerKeywordSymbol(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    source_index: usize,
+) Analyser.Error!?Analyser.DeclWithHandle {
+    const tree = &handle.tree;
+    const tok = offsets.sourceIndexToTokenIndex(tree, source_index).preferLeft();
+    switch (tree.tokenTag(tok)) {
+        .keyword_struct,
+        .keyword_enum,
+        .keyword_union,
+        .keyword_opaque,
+        => {},
+        else => return null,
+    }
+
+    const nodes = try ast.nodesOverlappingIndex(analyser.arena, tree, tree.tokenStart(tok));
+    var buf: [2]Ast.Node.Index = undefined;
+    for (nodes) |node| {
+        if (tree.fullContainerDecl(&buf, node) == null) continue;
+        if (tree.nodeMainToken(node) != tok) continue;
+        if (try findEnclosingContainerOwner(analyser.arena, handle, node)) |owner| return owner;
+        if (findContainerThisAlias(handle, node)) |this_alias| return this_alias;
+        return null;
+    }
+    return null;
+}
+
 const Builder = struct {
     reference_token_map: std.array_hash_map.Auto(*DocumentStore.Handle, std.ArrayList(Ast.TokenIndex)) = .empty,
-    /// this is the declaration we are searching for
-    target_symbol: Analyser.DeclWithHandle,
-    target_symbol_name: []const u8,
-    target_symbol_name_token: Ast.TokenIndex,
+    /// declarations we are searching for (primary target first, followed by associated aliases/instantiations)
+    target_symbols: std.ArrayList(Analyser.DeclWithHandle) = .empty,
+    target_names: std.StringHashMapUnmanaged(void) = .empty,
+    added_tokens: std.ArrayHashMapUnmanaged(Analyser.TokenWithHandle, void, Analyser.TokenWithHandle.Context, false) = .empty,
     /// the decl is local to a function, block, etc
     local_only_decl: bool,
-    /// Whether the `target_symbol` has been added
-    did_add_target_symbol: bool = false,
+    include_decl: bool,
+    is_factory_search: bool = false,
     resolve_aliases: bool,
     analyser: *Analyser,
     encoding: offsets.Encoding,
 
-    fn add(self: *Builder, handle: *DocumentStore.Handle, token_index: Ast.TokenIndex) error{OutOfMemory}!void {
-        if (self.target_symbol.handle == handle and
-            self.target_symbol_name_token == token_index)
-        {
-            if (self.did_add_target_symbol) return;
-            self.did_add_target_symbol = true;
+    fn primarySymbol(self: *const Builder) Analyser.DeclWithHandle {
+        return self.target_symbols.items[0];
+    }
+
+    fn matchesTargetSymbol(self: *const Builder, candidate: Analyser.DeclWithHandle) bool {
+        for (self.target_symbols.items) |target| {
+            if (target.eql(candidate)) return true;
         }
+        return false;
+    }
+
+    fn addTargetSymbol(self: *Builder, decl: Analyser.DeclWithHandle) error{OutOfMemory}!void {
+        if (self.matchesTargetSymbol(decl)) return;
+        try self.target_symbols.append(self.analyser.arena, decl);
+        const name = offsets.identifierTokenToNameSlice(&decl.handle.tree, decl.nameToken());
+        try self.target_names.put(self.analyser.arena, name, {});
+        if (self.include_decl) {
+            try self.add(decl.handle, decl.nameToken());
+        }
+    }
+
+    fn collectRootFactoryInstantiations(self: *Builder, handle: *DocumentStore.Handle) Analyser.Error!void {
+        if (!self.is_factory_search) return;
+        const factory_decl = self.primarySymbol();
+        for (handle.tree.rootDecls()) |decl_node| {
+            if (try isFactoryInstantiationOf(self.analyser, handle, decl_node, factory_decl)) {
+                try self.addTargetSymbol(.{ .decl = .{ .ast_node = decl_node }, .handle = handle });
+            }
+        }
+    }
+
+    fn add(self: *Builder, handle: *DocumentStore.Handle, token_index: Ast.TokenIndex) error{OutOfMemory}!void {
+        const added = try self.added_tokens.getOrPut(self.analyser.arena, .{ .handle = handle, .token = token_index });
+        if (added.found_existing) return;
         const gop = try self.reference_token_map.getOrPut(self.analyser.arena, handle);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.analyser.arena, token_index);
@@ -160,6 +327,10 @@ const Builder = struct {
         const tracy_zone = tracy.trace(@src());
         defer tracy_zone.end();
 
+        if (node == .root) {
+            try self.collectRootFactoryInstantiations(handle);
+        }
+
         const arena = self.analyser.arena;
         try referenceNode(self, handle, node, &.{});
         var ancestors: std.ArrayList(Ast.Node.Index) = .empty;
@@ -204,7 +375,7 @@ const Builder = struct {
                     if (std.zig.isPrimitive(name)) return;
                 }
 
-                if (!std.mem.eql(u8, name, builder.target_symbol_name)) return;
+                if (!builder.target_names.contains(name)) return;
 
                 const candidate = try builder.analyser.lookupSymbolGlobal(
                     handle,
@@ -217,7 +388,7 @@ const Builder = struct {
                 if (builder.local_only_decl) return;
                 const lhs_node, const field_token = tree.nodeData(node).node_and_token;
                 const name = offsets.identifierTokenToNameSlice(tree, field_token);
-                if (!std.mem.eql(u8, name, builder.target_symbol_name)) return;
+                if (!builder.target_names.contains(name)) return;
 
                 const lhs = try builder.analyser.resolveTypeOfNode(.of(lhs_node, handle)) orelse return;
                 const deref_lhs = try builder.analyser.resolveDerefType(lhs) orelse lhs;
@@ -247,7 +418,7 @@ const Builder = struct {
                 for (struct_init.ast.fields) |value_node| { // the node of `value` in `.name = value`
                     const name_token = tree.firstToken(value_node) - 2; // math our way two token indexes back to get the `name`
                     const name = offsets.identifierTokenToNameSlice(tree, name_token);
-                    if (!std.mem.eql(u8, name, builder.target_symbol_name)) continue;
+                    if (!builder.target_names.contains(name)) continue;
 
                     const candidate = try container_type.lookupSymbol(builder.analyser, name) orelse continue;
 
@@ -261,7 +432,7 @@ const Builder = struct {
                 if (builder.local_only_decl) return;
                 const name_token = tree.nodeMainToken(node);
                 const name = offsets.identifierTokenToNameSlice(&handle.tree, name_token);
-                if (!std.mem.eql(u8, name, builder.target_symbol_name)) return;
+                if (!builder.target_names.contains(name)) return;
                 const candidate, _ = try builder.analyser.lookupSymbolFieldInit(handle, name, node, ancestors) orelse return;
                 break :candidate .{ candidate, name_token };
             },
@@ -270,12 +441,16 @@ const Builder = struct {
             .aligned_var_decl,
             .simple_var_decl,
             => {
+                if (builder.is_factory_search and try isFactoryInstantiationOf(builder.analyser, handle, node, builder.primarySymbol())) {
+                    try builder.addTargetSymbol(.{ .decl = .{ .ast_node = node }, .handle = handle });
+                    return;
+                }
                 if (builder.local_only_decl) return;
                 const var_decl = tree.fullVarDecl(node).?;
 
                 const alias_name_token = var_decl.ast.mut_token + 1;
                 const alias_name = offsets.identifierTokenToNameSlice(&handle.tree, alias_name_token);
-                if (!std.mem.eql(u8, alias_name, builder.target_symbol_name)) return;
+                if (!builder.target_names.contains(alias_name)) return;
 
                 const init_node = var_decl.ast.init_node.unwrap() orelse return;
                 if (tree.tokenTag(var_decl.ast.mut_token) != .keyword_const) return;
@@ -283,7 +458,7 @@ const Builder = struct {
                 if (tree.nodeTag(init_node) != .field_access) return;
                 const lhs_node, const field_token = tree.nodeData(init_node).node_and_token;
                 const field_name = offsets.identifierTokenToNameSlice(tree, field_token);
-                if (!std.mem.eql(u8, field_name, builder.target_symbol_name)) return;
+                if (!std.mem.eql(u8, field_name, alias_name)) return;
 
                 const lhs = try builder.analyser.resolveTypeOfNode(.of(lhs_node, handle)) orelse return;
                 const deref_lhs = try builder.analyser.resolveDerefType(lhs) orelse lhs;
@@ -298,11 +473,75 @@ const Builder = struct {
             candidate = try builder.analyser.resolveVarDeclAlias(candidate) orelse candidate;
         }
 
-        if (builder.target_symbol.eql(candidate)) {
+        if (builder.matchesTargetSymbol(candidate)) {
             try builder.add(handle, name_token);
         }
     }
 };
+
+fn resolveCanonicalTargetSymbol(
+    analyser: *Analyser,
+    dealiased_symbol: Analyser.DeclWithHandle,
+) Analyser.Error!Analyser.DeclWithHandle {
+    if (dealiased_symbol.decl != .ast_node) return dealiased_symbol;
+    const handle = dealiased_symbol.handle;
+    const node = dealiased_symbol.decl.ast_node;
+    if (!isThisAlias(&handle.tree, node)) return dealiased_symbol;
+
+    const doc_scope = try handle.getDocumentScope();
+    const source_index = handle.tree.tokenStart(dealiased_symbol.nameToken());
+    const container_scope = Analyser.innermostScopeAtIndexWithTag(doc_scope, source_index, .init(.{
+        .container = true,
+    })).unwrap() orelse return dealiased_symbol;
+    const container_node = doc_scope.getScopeAstNode(container_scope) orelse return dealiased_symbol;
+
+    return try findEnclosingContainerOwner(analyser.arena, handle, container_node) orelse dealiased_symbol;
+}
+
+fn populateAdditionalTargets(
+    builder: *Builder,
+    dealiased_symbol: Analyser.DeclWithHandle,
+    canonical_symbol: Analyser.DeclWithHandle,
+) Analyser.Error!void {
+    if (!dealiased_symbol.eql(canonical_symbol)) {
+        try builder.addTargetSymbol(dealiased_symbol);
+    }
+    if (canonical_symbol.decl != .ast_node) return;
+
+    const handle = canonical_symbol.handle;
+    const tree = &handle.tree;
+    const node = canonical_symbol.decl.ast_node;
+
+    if (tree.fullVarDecl(node)) |var_decl| {
+        if (tree.tokenTag(var_decl.ast.mut_token) != .keyword_const) return;
+        const init_node = var_decl.ast.init_node.unwrap() orelse return;
+        if (findContainerThisAlias(handle, init_node)) |this_alias| {
+            try builder.addTargetSymbol(this_alias);
+        }
+        return;
+    }
+
+    const container_node = findFactoryReturnedContainer(tree, node) orelse return;
+    builder.is_factory_search = true;
+    if (findContainerThisAlias(handle, container_node)) |this_alias| {
+        try builder.addTargetSymbol(this_alias);
+    }
+    try builder.collectRootFactoryInstantiations(handle);
+}
+
+fn hasPublicTargetSymbol(builder: *const Builder) bool {
+    for (builder.target_symbols.items) |sym| {
+        if (!sym.isPublic()) continue;
+        const doc_scope = sym.handle.getDocumentScope() catch continue;
+        const src_idx = sym.handle.tree.tokenStart(sym.nameToken());
+        const sc_idx = Analyser.innermostScopeAtIndexWithTag(doc_scope, src_idx, .init(.{
+            .block = true,
+            .container = true,
+        })).unwrap() orelse continue;
+        if (doc_scope.getScopeTag(sc_idx) == .container) return true;
+    }
+    return false;
+}
 
 fn symbolReferences(
     analyser: *Analyser,
@@ -323,7 +562,7 @@ fn symbolReferences(
 
     const target_symbol, const resolve_aliases = switch (request) {
         .highlight, .rename => .{ root_symbol, dealiased_symbol.eql(root_symbol) },
-        .references => .{ dealiased_symbol, true },
+        .references => .{ try resolveCanonicalTargetSymbol(analyser, dealiased_symbol), true },
     };
 
     const doc_scope = try target_symbol.handle.getDocumentScope();
@@ -358,28 +597,25 @@ fn symbolReferences(
         .error_token => return .empty,
     };
 
+    const should_include_decl = include_decl and
+        (request != .highlight or target_symbol.handle.uri.eql(current_handle.uri));
+
     var builder: Builder = .{
         .analyser = analyser,
-        .target_symbol = target_symbol,
-        .target_symbol_name = offsets.identifierTokenToNameSlice(
-            &target_symbol.handle.tree,
-            target_symbol.nameToken(),
-        ),
-        .target_symbol_name_token = target_symbol.nameToken(),
         .local_only_decl = local_node != null,
+        .include_decl = should_include_decl,
         .resolve_aliases = resolve_aliases,
         .encoding = encoding,
     };
 
-    blk: {
-        if (!include_decl) break :blk;
-        if (request == .highlight and !target_symbol.handle.uri.eql(current_handle.uri)) break :blk;
-        try builder.add(target_symbol.handle, target_symbol.nameToken());
+    try builder.addTargetSymbol(target_symbol);
+    if (request == .references) {
+        try populateAdditionalTargets(&builder, dealiased_symbol, target_symbol);
     }
 
     try builder.collectReferences(current_handle, local_node orelse .root);
 
-    const workspace = local_node == null and request != .highlight and target_symbol.isPublic();
+    const workspace = local_node == null and request != .highlight and hasPublicTargetSymbol(&builder);
     if (workspace) {
         var uris = try gatherWorkspaceReferenceCandidates(
             analyser.store,
@@ -781,6 +1017,19 @@ fn referencesHandler(
 
     // TODO: Make this work with branching types
     const locations = locs: {
+        if (request == .references) {
+            if (try resolveContainerKeywordSymbol(&analyser, handle, source_index)) |container_sym| {
+                break :locs try symbolReferences(
+                    &analyser,
+                    request,
+                    container_sym,
+                    server.offset_encoding,
+                    include_decl,
+                    handle,
+                );
+            }
+        }
+
         if (pos_context == .keyword and request != .rename) {
             break :locs try controlFlowReferences(
                 arena,

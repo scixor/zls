@@ -4964,6 +4964,27 @@ test "null-terminated slice" {
     });
 }
 
+test "comptime factory with statements after return and comptime arithmetic" {
+    try testCompletion(
+        \\fn Matrix(comptime n: usize) type {
+        \\    if (n == 0) @compileError("invalid");
+        \\    return struct {
+        \\        pub const Vec = [n]f32;
+        \\        rows: [n]Vec,
+        \\    };
+        \\    const ignored = 1;
+        \\    _ = ignored;
+        \\}
+        \\const Mat2 = Matrix(2);
+        \\test {
+        \\    var m: Mat2 = undefined;
+        \\    m.<cursor>
+        \\}
+    , &.{
+        .{ .label = "rows", .kind = .Field, .detail = "[2][2]f32" },
+    });
+}
+
 fn testCompletion(source: []const u8, expected_completions: []const Completion) !void {
     try testCompletionWithOptions(source, expected_completions, .{});
 }

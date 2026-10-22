@@ -50,7 +50,7 @@ const ResolutionKey = struct {
     values: TokenToTypeMap,
     resolve_numbers: bool,
 
-    const Context = struct {
+    pub const Context = struct {
         pub fn hash(_: Context, key: ResolutionKey) u64 {
             var hash_value = (NodeWithUri.Context{}).hash(key.node);
             for (key.values.keys(), key.values.values()) |token, value| {
@@ -845,20 +845,37 @@ fn resolveGenericTypeInternal(
     return resolved;
 }
 
-fn findReturnStatement(tree: *const Ast, body: Ast.Node.Index) ?Ast.Node.Index {
+fn findReturnStatementInternal(tree: *const Ast, body: Ast.Node.Index, already_found: *bool) ?Ast.Node.Index {
     var result: ?Ast.Node.Index = null;
 
     var buffer: [2]Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&buffer, body) orelse return null;
 
     for (statements) |child_idx| {
-        if (tree.nodeTag(child_idx) != .@"return") continue;
-        result = child_idx;
+        if (tree.nodeTag(child_idx) == .@"return") {
+            if (already_found.*) return null;
+            already_found.* = true;
+            result = child_idx;
+            continue;
+        }
+
+        const prev_found = already_found.*;
+        const child_result = findReturnStatementInternal(tree, child_idx, already_found);
+        if (already_found.* and !prev_found) {
+            if (child_result == null) return null;
+            result = child_result;
+        } else if (prev_found and child_result != null) {
+            return null;
+        }
     }
 
     return result;
 }
 
+pub fn findReturnStatement(tree: *const Ast, body: Ast.Node.Index) ?Ast.Node.Index {
+    var already_found = false;
+    return findReturnStatementInternal(tree, body, &already_found);
+}
 /// if `func_type_param` is callable, returns an instance of the return type.
 /// otherwise, returns null.
 pub fn resolveReturnType(analyser: *Analyser, func_type_param: Type) error{OutOfMemory}!?Type {
@@ -1176,7 +1193,11 @@ pub fn resolveBracketAccess(analyser: *Analyser, lhs_binding: Binding, rhs: Brac
     const elem_ty = elem: switch (lhs.data) {
         .tuple => |fields| switch (rhs) {
             .single => |index_maybe| {
-                const index = index_maybe orelse return null;
+                const index = index_maybe orelse {
+                    if (fields.len == 0) return null;
+                    const instance = try fields[0].instanceUnchecked(analyser);
+                    return .{ .type = instance, .is_const = is_const };
+                };
                 if (index >= fields.len) return null;
                 const instance = try fields[@intCast(index)].instanceUnchecked(analyser);
                 return .{ .type = instance, .is_const = is_const };
@@ -1490,6 +1511,169 @@ fn resolveInternPoolValue(analyser: *Analyser, options: ResolveOptions) Error!?I
         .ip_index => |payload| return payload.index,
         else => return null,
     }
+}
+
+fn resolveComptimeIntBinOp(
+    analyser: *Analyser,
+    op: Ast.Node.Tag,
+    lhs_ty: Type,
+    rhs_ty: Type,
+    peer_ty: ?Type,
+) error{OutOfMemory}!?Type {
+    if (analyser.comptime_values.count() == 0) return null;
+    const resolved_peer = peer_ty orelse return null;
+    const lhs_ip = lhs_ty.ipIndex() orelse return null;
+    const rhs_ip = rhs_ty.ipIndex() orelse return null;
+    const lhs_tag = analyser.ip.zigTypeTag(analyser.ip.typeOf(lhs_ip)) orelse return null;
+    const rhs_tag = analyser.ip.zigTypeTag(analyser.ip.typeOf(rhs_ip)) orelse return null;
+    if ((lhs_tag != .int and lhs_tag != .comptime_int) or (rhs_tag != .int and rhs_tag != .comptime_int)) return null;
+    const l_int = analyser.ip.toInt(lhs_ip, i128) orelse return null;
+    const r_int = analyser.ip.toInt(rhs_ip, i128) orelse return null;
+    const res_int: i128 = switch (op) {
+        .add => std.math.add(i128, l_int, r_int) catch return null,
+        .sub => std.math.sub(i128, l_int, r_int) catch return null,
+        .mul => std.math.mul(i128, l_int, r_int) catch return null,
+        .div => if (r_int == 0) return null else std.math.divTrunc(i128, l_int, r_int) catch return null,
+        else => return null,
+    };
+    const res_ty_ip = switch (resolved_peer.data) {
+        .ip_index => |payload| payload.type,
+        else => return null,
+    };
+    const res_tag = analyser.ip.zigTypeTag(res_ty_ip) orelse return null;
+    if (res_tag != .int and res_tag != .comptime_int) return null;
+    const val_ip: InternPool.Index = if (res_int >= 0) blk: {
+        const u_val = std.math.cast(u64, res_int) orelse return null;
+        break :blk try analyser.ip.get(.{ .int_u64_value = .{ .ty = res_ty_ip, .int = u_val } });
+    } else blk: {
+        const i_val = std.math.cast(i64, res_int) orelse return null;
+        break :blk try analyser.ip.get(.{ .int_i64_value = .{ .ty = res_ty_ip, .int = i_val } });
+    };
+    if (res_ty_ip != .comptime_int_type) {
+        var arena_allocator: std.heap.ArenaAllocator = .init(analyser.gpa);
+        defer arena_allocator.deinit();
+        var err_msg: ErrorMsg = undefined;
+        const coerced = try analyser.ip.coerce(arena_allocator.allocator(), res_ty_ip, val_ip, builtin.target, &err_msg);
+        if (coerced == .none or analyser.ip.isUnknown(coerced)) return null;
+        return Type.fromIP(analyser, res_ty_ip, coerced);
+    }
+    return Type.fromIP(analyser, res_ty_ip, val_ip);
+}
+
+fn resolveComptimeIf(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    if_node: Ast.full.If,
+) Error!?Type {
+    if (if_node.payload_token != null) return null;
+    if (analyser.comptime_values.count() == 0) return null;
+
+    const cond_ty = try analyser.resolveTypeOfNodeInternal(.of(if_node.ast.cond_expr, handle)) orelse return null;
+    if (cond_ty.is_type_val) return null;
+    const cond_ip = cond_ty.ipIndex() orelse return null;
+
+    if (cond_ip == .bool_true) {
+        return try analyser.resolveTypeOfNodeInternal(.of(if_node.ast.then_expr, handle));
+    }
+    if (cond_ip == .bool_false) {
+        const else_expr = if_node.ast.else_expr.unwrap() orelse
+            return Type.fromIP(analyser, .void_type, .void_value);
+        return try analyser.resolveTypeOfNodeInternal(.of(else_expr, handle));
+    }
+    return null;
+}
+
+fn resolveComptimeComparison(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    tag: Ast.Node.Tag,
+    lhs_ty: Type,
+    rhs_node: Ast.Node.Index,
+) Error!?Type {
+    if (analyser.comptime_values.count() == 0) return null;
+    const rhs_ty = try analyser.resolveTypeOfNodeInternal(.of(rhs_node, handle)) orelse return null;
+
+    if (lhs_ty.is_type_val and rhs_ty.is_type_val) {
+        if (tag != .equal_equal and tag != .bang_equal) return null;
+        if (lhs_ty.isGenericType() or rhs_ty.isGenericType()) return null;
+        if (lhs_ty.eql(.unknown_type) or rhs_ty.eql(.unknown_type)) return null;
+
+        const is_eq = lhs_ty.eql(rhs_ty);
+        const result_bool = if (tag == .equal_equal) is_eq else !is_eq;
+        return Type.fromIP(analyser, .bool_type, if (result_bool) .bool_true else .bool_false);
+    }
+
+    if (lhs_ty.is_type_val or rhs_ty.is_type_val) return null;
+    const lhs_ip = lhs_ty.ipIndex() orelse return null;
+    const rhs_ip = rhs_ty.ipIndex() orelse return null;
+
+    if ((tag == .equal_equal or tag == .bang_equal) and
+        (lhs_ip == .bool_true or lhs_ip == .bool_false) and
+        (rhs_ip == .bool_true or rhs_ip == .bool_false))
+    {
+        const is_eq = lhs_ip == rhs_ip;
+        const result_bool = if (tag == .equal_equal) is_eq else !is_eq;
+        return Type.fromIP(analyser, .bool_type, if (result_bool) .bool_true else .bool_false);
+    }
+
+    const lhs_tag = analyser.ip.zigTypeTag(analyser.ip.typeOf(lhs_ip));
+    const rhs_tag = analyser.ip.zigTypeTag(analyser.ip.typeOf(rhs_ip));
+    if (lhs_tag != .int and lhs_tag != .comptime_int) return null;
+    if (rhs_tag != .int and rhs_tag != .comptime_int) return null;
+
+    const l_int = analyser.ip.toInt(lhs_ip, i128) orelse return null;
+    const r_int = analyser.ip.toInt(rhs_ip, i128) orelse return null;
+    const result_bool = switch (tag) {
+        .equal_equal => l_int == r_int,
+        .bang_equal => l_int != r_int,
+        .less_than => l_int < r_int,
+        .greater_than => l_int > r_int,
+        .less_or_equal => l_int <= r_int,
+        .greater_or_equal => l_int >= r_int,
+        else => unreachable,
+    };
+    return Type.fromIP(analyser, .bool_type, if (result_bool) .bool_true else .bool_false);
+}
+
+fn resolveComptimeBoolBinOp(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    tag: Ast.Node.Tag,
+    lhs: Ast.Node.Index,
+    rhs: Ast.Node.Index,
+) Error!?Type {
+    if (analyser.comptime_values.count() == 0) return null;
+
+    const lhs_ty = try analyser.resolveTypeOfNodeInternal(.of(lhs, handle)) orelse return null;
+    if (lhs_ty.is_type_val) return null;
+    const lhs_ip = lhs_ty.ipIndex() orelse return null;
+    if (lhs_ip != .bool_true and lhs_ip != .bool_false) return null;
+
+    if (tag == .bool_and and lhs_ip == .bool_false) return Type.fromIP(analyser, .bool_type, .bool_false);
+    if (tag == .bool_or and lhs_ip == .bool_true) return Type.fromIP(analyser, .bool_type, .bool_true);
+
+    const rhs_ty = try analyser.resolveTypeOfNodeInternal(.of(rhs, handle)) orelse return null;
+    if (rhs_ty.is_type_val) return null;
+    const rhs_ip = rhs_ty.ipIndex() orelse return null;
+    if (rhs_ip != .bool_true and rhs_ip != .bool_false) return null;
+
+    return Type.fromIP(analyser, .bool_type, rhs_ip);
+}
+
+fn resolveComptimeBoolNot(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    expr: Ast.Node.Index,
+) Error!?Type {
+    if (analyser.comptime_values.count() == 0) return null;
+
+    const expr_ty = try analyser.resolveTypeOfNodeInternal(.of(expr, handle)) orelse return null;
+    if (expr_ty.is_type_val) return null;
+    const ip = expr_ty.ipIndex() orelse return null;
+
+    if (ip == .bool_true) return Type.fromIP(analyser, .bool_type, .bool_false);
+    if (ip == .bool_false) return Type.fromIP(analyser, .bool_type, .bool_true);
+    return null;
 }
 
 fn resolveIntegerLiteral(analyser: *Analyser, comptime T: type, options: ResolveOptions) Error!?T {
@@ -1875,6 +2059,7 @@ fn resolveFunctionTypeFromCall(
     const has_self_param = call.ast.params.len + 1 == func_info.parameters.len and
         try analyser.isInstanceCall(handle, call, func_ty);
 
+    var has_comptime_value_bindings = false;
     const parameters = func_info.parameters[@intFromBool(has_self_param)..];
     const arguments = call.ast.params;
     const min_len = @min(parameters.len, arguments.len);
@@ -1892,6 +2077,7 @@ fn resolveFunctionTypeFromCall(
             else
                 try analyser.resolveInternPoolValue(.of(arg, handle))) orelse continue;
             try meta_params.put(analyser.arena, .{ .token = param_name_token, .handle = func_info.handle }, Type.fromIP(analyser, analyser.ip.typeOf(value), value));
+            has_comptime_value_bindings = true;
             continue;
         }
 
@@ -1910,7 +2096,27 @@ fn resolveFunctionTypeFromCall(
         }
     }
 
-    return try analyser.resolveGenericType(func_ty, meta_params);
+    var resolved_func = try analyser.resolveGenericType(func_ty, meta_params);
+    if (has_comptime_value_bindings and
+        (resolved_func.data.function.return_value.data != .container or !resolved_func.data.function.return_value.is_type_val))
+    {
+        const previous_values = analyser.comptime_values;
+        defer analyser.comptime_values = previous_values;
+        var values = try previous_values.clone(analyser.arena);
+        for (meta_params.keys(), meta_params.values()) |token, value| {
+            if (value.is_type_val) {
+                if (value.isGenericType() or value.eql(.unknown_type)) continue;
+            } else if (value.ipIndex() == null) continue;
+            try values.put(analyser.arena, token, value);
+        }
+        analyser.comptime_values = values;
+        if (try analyser.resolveReturnValueOfFuncNode(func_info.handle, func_info.node)) |specialized_ret| {
+            resolved_func.data.function.return_value = try analyser.allocType(
+                try analyser.resolveGenericType(specialized_ret, meta_params),
+            );
+        }
+    }
+    return resolved_func;
 }
 
 const BreakIterator = struct {
@@ -2613,6 +2819,7 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                 Type.fromIP(analyser, .unknown_type, null);
 
             const info: Type.Data.Function = .{
+                .node = node,
                 .handle = handle,
                 .fn_token = fn_proto.ast.fn_token,
                 .container_type = try analyser.allocType(container_type),
@@ -2632,6 +2839,7 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
         },
         .@"if", .if_simple => {
             const if_node = ast.fullIf(tree, node).?;
+            if (try analyser.resolveComptimeIf(handle, if_node)) |ty| return ty;
 
             var either_buffer: [2]Type.TypeWithDescriptor = undefined;
             var either: std.ArrayList(Type.TypeWithDescriptor) = .initBuffer(&either_buffer);
@@ -2774,11 +2982,18 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
         .greater_than,
         .less_or_equal,
         .greater_or_equal,
-        => {
-            const lhs, _ = tree.nodeData(node).node_and_node;
+        => |tag| {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+
+            const prev_resolve_numbers = analyser.resolve_number_literal_values;
+            if (analyser.comptime_values.count() != 0) analyser.resolve_number_literal_values = true;
+            defer analyser.resolve_number_literal_values = prev_resolve_numbers;
 
             const ty = try analyser.resolveTypeOfNodeInternal(.of(lhs, handle)) orelse
                 return Type.fromIP(analyser, .bool_type, null);
+
+            if (try analyser.resolveComptimeComparison(handle, tag, ty, rhs)) |cmp_ty| return cmp_ty;
+
             const typeof = try ty.typeOf(analyser);
 
             if (typeof.ipIndex()) |index| {
@@ -2799,8 +3014,17 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
 
         .bool_and,
         .bool_or,
-        .bool_not,
-        => return Type.fromIP(analyser, .bool_type, null),
+        => |tag| {
+            const lhs, const rhs = tree.nodeData(node).node_and_node;
+            if (try analyser.resolveComptimeBoolBinOp(handle, tag, lhs, rhs)) |ty| return ty;
+            return Type.fromIP(analyser, .bool_type, null);
+        },
+
+        .bool_not => {
+            const expr = tree.nodeData(node).node;
+            if (try analyser.resolveComptimeBoolNot(handle, expr)) |ty| return ty;
+            return Type.fromIP(analyser, .bool_type, null);
+        },
 
         .bit_not,
         .negation,
@@ -2954,23 +3178,41 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
         .bit_and,
         .bit_xor,
         .bit_or,
-        => {
+        => |tag| {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
+            const prev_resolve_numbers = analyser.resolve_number_literal_values;
+            if (analyser.comptime_values.count() != 0 and (tag == .mul or tag == .div)) {
+                analyser.resolve_number_literal_values = true;
+            }
+            defer analyser.resolve_number_literal_values = prev_resolve_numbers;
+
             var lhs_ty = try analyser.resolveTypeOfNodeInternal(.of(lhs, handle)) orelse return null;
             if (lhs_ty.is_type_val) return null;
             var rhs_ty = try analyser.resolveTypeOfNodeInternal(.of(rhs, handle)) orelse return null;
             if (rhs_ty.is_type_val) return null;
+            const raw_lhs = lhs_ty;
+            const raw_rhs = rhs_ty;
             lhs_ty = lhs_ty.withoutIPIndex(analyser);
             rhs_ty = rhs_ty.withoutIPIndex(analyser);
-            return analyser.resolvePeerTypes(lhs_ty, rhs_ty);
+            const peer = try analyser.resolvePeerTypes(lhs_ty, rhs_ty);
+            if (tag == .mul or tag == .div) {
+                if (try analyser.resolveComptimeIntBinOp(tag, raw_lhs, raw_rhs, peer)) |folded| return folded;
+            }
+            return peer;
         },
 
         .add => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
+            const prev_resolve_numbers = analyser.resolve_number_literal_values;
+            if (analyser.comptime_values.count() != 0) analyser.resolve_number_literal_values = true;
+            defer analyser.resolve_number_literal_values = prev_resolve_numbers;
+
             var lhs_ty = try analyser.resolveTypeOfNodeInternal(.of(lhs, handle)) orelse return null;
             if (lhs_ty.is_type_val) return null;
             var rhs_ty = try analyser.resolveTypeOfNodeInternal(.of(rhs, handle)) orelse return null;
             if (rhs_ty.is_type_val) return null;
+            const raw_lhs = lhs_ty;
+            const raw_rhs = rhs_ty;
             lhs_ty = lhs_ty.withoutIPIndex(analyser);
             rhs_ty = rhs_ty.withoutIPIndex(analyser);
             if (lhs_ty.pointerSize(analyser)) |lhs_size| {
@@ -2979,15 +3221,23 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                     else => null,
                 };
             }
-            return try analyser.resolvePeerTypes(lhs_ty, rhs_ty);
+            const peer = try analyser.resolvePeerTypes(lhs_ty, rhs_ty);
+            if (try analyser.resolveComptimeIntBinOp(.add, raw_lhs, raw_rhs, peer)) |folded| return folded;
+            return peer;
         },
 
         .sub => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
+            const prev_resolve_numbers = analyser.resolve_number_literal_values;
+            if (analyser.comptime_values.count() != 0) analyser.resolve_number_literal_values = true;
+            defer analyser.resolve_number_literal_values = prev_resolve_numbers;
+
             var lhs_ty = try analyser.resolveTypeOfNodeInternal(.of(lhs, handle)) orelse return null;
             if (lhs_ty.is_type_val) return null;
             var rhs_ty = try analyser.resolveTypeOfNodeInternal(.of(rhs, handle)) orelse return null;
             if (rhs_ty.is_type_val) return null;
+            const raw_lhs = lhs_ty;
+            const raw_rhs = rhs_ty;
             lhs_ty = lhs_ty.withoutIPIndex(analyser);
             rhs_ty = rhs_ty.withoutIPIndex(analyser);
             if (lhs_ty.pointerSize(analyser)) |lhs_size| {
@@ -3002,7 +3252,9 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) Error
                     };
                 }
             }
-            return try analyser.resolvePeerTypes(lhs_ty, rhs_ty);
+            const peer = try analyser.resolvePeerTypes(lhs_ty, rhs_ty);
+            if (try analyser.resolveComptimeIntBinOp(.sub, raw_lhs, raw_rhs, peer)) |folded| return folded;
+            return peer;
         },
 
         .shl,
@@ -3309,6 +3561,7 @@ pub const Type = struct {
         };
 
         pub const Function = struct {
+            node: Ast.Node.Index,
             fn_token: Ast.TokenIndex,
             handle: *DocumentStore.Handle,
 
@@ -3645,7 +3898,7 @@ pub const Type = struct {
                         return true;
                     }
                     for (info.parameters) |param| {
-                        if (param.type.data.isGeneric()) {
+                        if (param.modifier == .comptime_param or param.type.data.isGeneric()) {
                             return true;
                         }
                     }
@@ -3764,6 +4017,7 @@ pub const Type = struct {
                 },
                 .function => |info| return .{
                     .function = .{
+                        .node = info.node,
                         .fn_token = info.fn_token,
                         .handle = info.handle,
                         .container_type = try analyser.allocType(try analyser.resolveGenericTypeInternal(info.container_type.*, bound_params, visiting)),
@@ -5029,7 +5283,7 @@ pub const NodeWithUri = struct {
     node: Ast.Node.Index,
     uri: Uri,
 
-    const Context = struct {
+    pub const Context = struct {
         pub fn hash(self: Context, item: NodeWithUri) u64 {
             _ = self;
             var hasher: std.hash.Wyhash = .init(0);
@@ -5735,7 +5989,7 @@ pub const TokenWithHandle = struct {
         return true;
     }
 
-    const Context = struct {
+    pub const Context = struct {
         pub fn hash(self: Context, token_handle: TokenWithHandle) u32 {
             _ = self;
             var hasher: std.hash.Wyhash = .init(0);
@@ -5979,7 +6233,9 @@ pub const DeclWithHandle = struct {
                 var values = previous_values;
                 var cloned = false;
                 for (container.data.container.bound_params.keys(), container.data.container.bound_params.values()) |token, value| {
-                    if (value.is_type_val or value.ipIndex() == null) continue;
+                    if (value.is_type_val) {
+                        if (value.isGenericType() or value.eql(.unknown_type)) continue;
+                    } else if (value.ipIndex() == null) continue;
                     if (values.get(token)) |old| if (old.eql(value)) continue;
                     if (!cloned) {
                         values = try values.clone(analyser.arena);

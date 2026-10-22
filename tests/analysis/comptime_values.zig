@@ -64,3 +64,38 @@ fn unresolved(comptime n: usize) void {
     const data = @as(Buffer(n), undefined).bytes;
     //    ^^^^ ([?]u8)()
 }
+
+fn Sample(comptime V: type) type {
+    return struct {
+        value: V,
+        derivative: if (V == f32) f32 else [2]V,
+    };
+}
+
+const sample_f32_deriv = @as(Sample(f32), undefined).derivative;
+//    ^^^^^^^^^^^^^^^^ (f32)()
+const sample_vec_deriv = @as(Sample([2]f32), undefined).derivative;
+//    ^^^^^^^^^^^^^^^^ ([2][2]f32)()
+
+fn BSpline(comptime order: usize) type {
+    return struct {
+        weights: [order + 1]f32,
+    };
+}
+
+const bspline_weights = @as(BSpline(3), undefined).weights;
+//    ^^^^^^^^^^^^^^^ ([4]f32)()
+
+fn Jet(comptime width: usize, comptime order: usize) type {
+    return struct {
+        coeffs: [order + 1]@Vector(width, f32),
+    };
+}
+
+fn evalJet(comptime width: usize, comptime order: usize) Jet(width, order) {
+    return undefined;
+}
+
+const jet_coeffs = evalJet(4, 2).coeffs;
+//    ^^^^^^^^^^ ([3]@Vector(4,f32))()
+
