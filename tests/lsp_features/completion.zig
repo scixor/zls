@@ -4983,6 +4983,58 @@ test "comptime factory with statements after return and comptime arithmetic" {
     , &.{
         .{ .label = "rows", .kind = .Field, .detail = "[2][2]f32" },
     });
+
+    try testCompletion(
+        \\const Vec2 = @Vector(2, f32);
+        \\const Mat2 = struct { cols: [2]Vec2 };
+        \\fn Sample(comptime V: type) type {
+        \\    return struct {
+        \\        value: V,
+        \\        jacobian: if (V == f32) f32 else if (V == Vec2) Mat2 else @compileError("unsupported"),
+        \\    };
+        \\}
+        \\test {
+        \\    const h: Sample(Vec2) = undefined;
+        \\    h.<cursor>
+        \\}
+    , &.{
+        .{ .label = "value", .kind = .Field, .detail = "@Vector(2,f32)" },
+        .{ .label = "jacobian", .kind = .Field, .detail = "Mat2" },
+    });
+
+    try testCompletion(
+        \\const Vec2 = @Vector(2, f32);
+        \\const Mat2 = struct { cols: [2]Vec2 };
+        \\fn Sample(comptime V: type) type {
+        \\    return struct {
+        \\        value: V,
+        \\        jacobian: if (V == f32) f32 else if (V == Vec2) Mat2 else @compileError("unsupported"),
+        \\    };
+        \\}
+        \\test {
+        \\    const h = Sample(Vec2){ .<cursor> };
+        \\}
+    , &.{
+        .{ .label = "value", .kind = .Field, .detail = "@Vector(2,f32)" },
+        .{ .label = "jacobian", .kind = .Field, .detail = "Mat2" },
+    });
+
+    try testCompletion(
+        \\const Vec2 = @Vector(2, f32);
+        \\const Mat2 = struct { cols: [2]Vec2 };
+        \\fn Sample(comptime V: type) type {
+        \\    return struct {
+        \\        value: V,
+        \\        jacobian: if (V == f32) f32 else if (V == Vec2) Mat2 else @compileError("unsupported"),
+        \\    };
+        \\}
+        \\test {
+        \\    const h: Sample(Vec2) = .{ .<cursor> };
+        \\}
+    , &.{
+        .{ .label = "value", .kind = .Field, .detail = "@Vector(2,f32)" },
+        .{ .label = "jacobian", .kind = .Field, .detail = "Mat2" },
+    });
 }
 
 fn testCompletion(source: []const u8, expected_completions: []const Completion) !void {

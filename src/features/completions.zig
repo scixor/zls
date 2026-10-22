@@ -1339,6 +1339,7 @@ fn getSwitchOrStructInitContext(
                             switch (tree.tokenTag(upper_index)) {
                                 .identifier, // `const s: S = .{.`, `S{.name = .`
                                 .period_asterisk, //  `s.* = .{.`
+                                .r_paren, // `const s: Sample(V) = .{.`
                                 => break :find_identifier,
                                 else => return null,
                             }
@@ -1677,6 +1678,11 @@ fn collectContainerNodes(
     const ancestors = try ast.nodesOverlappingIndexIncludingParseErrors(gpa, &handle.tree, source_index);
     defer gpa.free(ancestors);
 
+    if (try resolveCalledContainerNode(builder.analyser, handle, dot_context, ancestors)) |call_ty| {
+        _ = try call_ty.getAllTypesWithHandlesArraySet(builder.analyser, &types_with_handles);
+        return types_with_handles.keys();
+    }
+
     switch (handle.tree.nodeTag(ancestors[0])) {
         .field_access, .enum_literal => {
             if (try builder.analyser.resolveTypeOfNode(.of(ancestors[0], handle))) |ty| {
@@ -1716,6 +1722,22 @@ fn collectContainerNodes(
         else => {},
     }
     return types_with_handles.keys();
+}
+
+fn resolveCalledContainerNode(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    dot_context: EnumLiteralContext,
+    nodes: []const Ast.Node.Index,
+) Analyser.Error!?Analyser.Type {
+    if (!dot_context.need_ret_type or nodes.len <= 1) return null;
+    var call_buf: [1]Ast.Node.Index = undefined;
+    const call = handle.tree.fullCall(&call_buf, nodes[1]) orelse return null;
+    if (call.ast.fn_expr != nodes[0]) return null;
+
+    var ret_ty = (try analyser.resolveTypeOfNode(.of(nodes[1], handle))) orelse return null;
+    if (try analyser.resolveUnwrapErrorUnionType(ret_ty, .payload)) |unwrapped| ret_ty = unwrapped;
+    return ret_ty;
 }
 
 fn resolveBuiltinFnArg(
