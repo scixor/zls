@@ -12,6 +12,7 @@ const Analyser = @import("../analysis.zig");
 const DocumentStore = @import("../DocumentStore.zig");
 const Server = @import("../Server.zig");
 const Uri = @import("../Uri.zig");
+const lowlevel = @import("lowlevel.zig");
 
 const data = @import("version_data");
 
@@ -48,6 +49,15 @@ fn hoverSymbolWithType(
         decl_handle = try analyser.resolveVarDeclAlias(decl_handle) orelse break;
         maybe_resolved_type = maybe_resolved_type orelse try decl_handle.resolveType(analyser);
     }
+
+    try lowlevel.appendHoverInfo(
+        analyser,
+        arena,
+        decl_handle,
+        maybe_resolved_type,
+        markup_kind,
+        &doc_strings,
+    );
 
     const tree = &decl_handle.handle.tree;
     const def_str = switch (decl_handle.decl) {
